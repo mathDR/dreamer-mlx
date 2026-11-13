@@ -13,7 +13,7 @@ from mlx import nn
 from mlx.utils import tree_map
 
 from dreamer_mlx.world_model import ContinuousDreamerWorldModel
-
+from dreamer_mlx.data import SequenceReplayBuffer
 
 class OUExplorationNoise:
     """Generates temporally correlated random walks to build mechanical energy."""
@@ -33,93 +33,30 @@ class OUExplorationNoise:
         return self.state
 
 
-# =====================================================================
-# ACTOR-CRITIC IMPLEMENTATIONS
-# =====================================================================
-
-
-
-
-class SequenceReplayBuffer:
-    """
-    Stores full trajectories to sample chronological sub-sequences 
-    matching Dreamer's sequence length requirements.
-    """
-    def __init__(self, capacity=500, seq_len=16):
-        self.capacity = capacity
-        self.seq_len = seq_len
-        self.buffer = []
-
-    def add_episode(self, observations, actions, rewards, continues):
-        """Appends a completed episode trajectory dictionary to the buffer memory."""
-        if len(self.buffer) >= self.capacity:
-            self.buffer.pop(0)  # Evict oldest episode if capacity is exceeded
-            
-        self.buffer.append({
-            'obs': np.array(observations, dtype=np.float32),
-            'actions': np.array(actions, dtype=np.float32),
-            'rewards': np.array(rewards, dtype=np.float32),
-            'continues': np.array(continues, dtype=np.float32)
-        })
-
-    def sample_batch(self, batch_size):
-        """Samples a batch of synchronized, temporal sub-sequences."""
-        bo, ba, br, bc = [], [], [], []
-        
-        while len(bo) < batch_size:
-            # 1. Pick a random full episode from the history bank
-            ep = self.buffer[np.random.randint(0, len(self.buffer))]
-            ep_len = len(ep['obs'])
-            
-            # Skip episodes that are structurally too short to yield a valid sequence slice
-            if ep_len <= self.seq_len:
-                continue
-                
-            # 2. Pick a valid randomized start step window index
-            start = np.random.randint(0, ep_len - self.seq_len)
-            end = start + self.seq_len
-            
-            # 3. Harvest synchronized slices across all parameter dimensions
-            bo.append(ep['obs'][start:end])
-            ba.append(ep['actions'][start:end])
-            br.append(ep['rewards'][start:end])
-            bc.append(ep['continues'][start:end])
-            
-        # Compile lists into stacked MLX execution array structures
-        return (
-            mx.array(np.stack(bo)),
-            mx.array(np.stack(ba)),
-            mx.array(np.stack(br)),
-            mx.array(np.stack(bc))
-        )
-
-    def __len__(self):
-        """Exposes current total episode count inside the tracking array."""
-        return len(self.buffer)
-
-# =====================================================================
-# MAIN EXECUTION PIPELINE
-# =====================================================================
-
-# =====================================================================
-# MAIN EXECUTION PIPELINE
-# =====================================================================
-
-# =====================================================================
-# MAIN EXECUTION PIPELINE
-# =====================================================================
-
 def main():
     BATCH_SIZE, SEQ_LEN = 16, 64
     PRE_FILL_EPISODES = 30
     MAX_EPISODES = 500
+
+    EPISODE_LEN = 200
     
     print("Initializing Farama Gymnasium Pendulum Environment...")
     env = gym.make("Pendulum-v1")
     obs_dim = env.observation_space.shape[0]     # Unpacks (3,) -> 3
     action_dim = env.action_space.shape[0]       # Unpacks (1,) -> 1
     
-    replay_buffer = SequenceReplayBuffer(capacity=500, seq_len=SEQ_LEN)
+    replay_buffer = SequenceReplayBuffer(
+        capacity=100_000,  # e.g. 100_000 steps
+        example={
+            "obs": np.zeros(obs_dim, np.float32),
+            "action": np.zeros(action_dim, np.float32),
+            "reward": np.zeros(1, np.float32),
+            "cont": np.zeros(1, np.float32),
+            "is_last": np.bool_(False),  # marks the final step of each episode
+        },
+        terminal_key="is_last",  # sampled sequences never cross an episode boundary
+        seed=4,
+    )
     wm = ContinuousDreamerWorldModel(obs_dim=obs_dim, action_dim=action_dim, deter_dim=256, latent_dim=32)
     feat_dim = wm.rssm.deter_dim + wm.rssm.latent_dim
     actor = ContinuousActor(feature_dim=feat_dim, action_dim=action_dim)
@@ -155,94 +92,43 @@ def main():
 
     # --- INSIDE YOUR main() FUNCTION (SWAP THE PRE-FILL LOOP) ---
     print(f"Pre-filling Replay Buffer with {PRE_FILL_EPISODES} high-energy explosive episodes...")
-    
     for _ in range(PRE_FILL_EPISODES):
-        obs, _ = env.reset() 
-        obs_seq = [np.array(obs, dtype=np.float32).flatten()]
-        act_seq, rew_seq, cont_seq = [], [], []
-        
-        deter = mx.zeros((1, wm.rssm.deter_dim))
-        latent = mx.zeros((1, wm.rssm.latent_dim))
-        action_mx = mx.zeros((1, action_dim))
-        
-        # Bang-Bang holding variables
+        obs, _ = env.reset()
+
+        # Bang-bang holding variables
         current_torque = np.random.choice([-1.0, 1.0])
-        hold_duration = np.random.randint(10, 25)
-        step_countdown = hold_duration
-        
-        for _ in range(200):
-            obs_mx = mx.reshape(mx.array(obs), (1, -1))
-            embed = wm.encoder(obs_mx)
-            deter, latent = wm.rssm.observe_step(latent, action_mx, deter, embed)
-            
+        step_countdown = np.random.randint(10, 25)
+
+        for episode in range(EPISODE_LEN):
             # Manage holding timer
             step_countdown -= 1
             if step_countdown <= 0:
-                current_torque = -current_torque # Reverse direction completely
-                hold_duration = np.random.randint(10, 25)
-                step_countdown = hold_duration
-                
+                current_torque = -current_torque  # reverse direction completely
+                step_countdown = np.random.randint(10, 25)
+
             # Scale up to max environmental limits [-2.0, 2.0]
             action = np.array([current_torque], dtype=np.float32) * 2.0
             next_obs, reward, terminated, truncated, _ = env.step(action)
-            
-            reward_scalar = float(reward)
-            
-            obs_seq.append(np.array(next_obs, dtype=np.float32).flatten())
-            act_seq.append(np.array(action, dtype=np.float32).flatten())
-            rew_seq.append(np.array([reward_scalar * 0.05], dtype=np.float32))
-            cont_seq.append(np.array([0.0 if (terminated or truncated) else 1.0], dtype=np.float32))
-            
+            done = terminated or truncated
+
+            # obs_t pairs with action_t, reward_t, cont_t, exactly as before
+            replay_buffer.add(
+                {
+                    "obs": np.asarray(obs, dtype=np.float32).ravel(),
+                    "action": action,
+                    "reward": np.array([float(reward) * 0.05], dtype=np.float32),
+                    "cont": np.array([0.0 if done else 1.0], dtype=np.float32),
+                    "is_last": done or episode == EPISODE_LEN - 1,
+                }
+            )
+
             obs = next_obs
-            action_mx = mx.array(action)[None, ...]
-            
-        replay_buffer.add_episode(obs_seq[:200], act_seq[:200], rew_seq[:200], cont_seq[:200])
-
-    # 2. INTERACTIVE ONLINE REINFORCEMENT TRAINING LOOP
-    print("Beginning Continuous Flow Dreamer Execution Loop...")
-    for episode in range(MAX_EPISODES):
-        obs, _ = env.reset() 
-        deter = mx.zeros((1, wm.rssm.deter_dim))
-        latent = mx.zeros((1, wm.rssm.latent_dim))
-        action_mx = mx.zeros((1, action_dim))
-        
-        episode_reward = 0.0
-        obs_seq = [np.array(obs, dtype=np.float32).flatten()]
-        act_seq, rew_seq, cont_seq = [], [], []
-
-        for step in range(200):
-            obs_mx = mx.reshape(mx.array(obs), (1, -1)) 
-            embed = wm.encoder(obs_mx)
-            deter, latent = wm.rssm.observe_step(latent, action_mx, deter, embed)
-
-            features = mx.concatenate([deter, latent], axis=-1)
-            action_mx, _, _ = actor.sample_and_log_prob(features)
-            
-            noise = np.random.normal(0, 0.4, size=env.action_space.shape) # Injected variance
-            action_np = np.clip(np.array(action_mx).flatten() + noise, -1.0, 1.0) * 2.0 
-            
-            next_obs, reward, terminated, truncated, _ = env.step(action_np)
-            reward_scalar = float(reward)
-            episode_reward += reward_scalar 
-
-            # --- SHAPING FIX: Add an explicit height bonus to reward_scalar ---
-            # next_obs[0] is cos(theta). It is +1.0 at the absolute top, -1.0 at the bottom.
-            # This smoothly guides the model to favor height positions.
-            height_bonus = float(next_obs[0]) * 5.0
-            shaped_reward = (reward_scalar + height_bonus) * 0.05
-
-            obs_seq.append(np.array(next_obs, dtype=np.float32).flatten())
-            act_seq.append(np.array(action_np / 2.0, dtype=np.float32).flatten())  
-            rew_seq.append(np.array([shaped_reward], dtype=np.float32)) # Fed to the World Model
-            cont_seq.append(np.array([0.0 if (terminated or truncated) else 1.0], dtype=np.float32))
-            
-            obs = next_obs
-
-
-        replay_buffer.add_episode(obs_seq[:200], act_seq[:200], rew_seq[:200], cont_seq[:200])
+            if done:
+                break
 
         # --- GRAPH OPTIMIZATION PHASE ---
-        b_obs, b_actions, b_rewards, b_continues = replay_buffer.sample_batch(BATCH_SIZE)
+        b = replay_buffer.sample_sequences(32, 16)
+        b_obs, b_actions, b_rewards, b_continues = b["obs"], b["action"], b["reward"], b["cont"]
         
         # A. Optimize World Model Graph
         wm_loss, wm_grads = wm_grad_fn(wm, b_obs, b_actions, b_rewards, b_continues)
@@ -256,6 +142,7 @@ def main():
             sf_list = []
             for t in range(SEQ_LEN):
                 prev_a = b_actions[:, t-1] if t > 0 else mx.zeros_like(b_actions[:, 0])
+                breakpoint()
                 d_s, l_s = wm.rssm.observe_step(l_s, prev_a, d_s, embeds[:, t])
                 sf_list.append(mx.concatenate([d_s, l_s], axis=-1))
             

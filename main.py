@@ -1,9 +1,11 @@
-import numpy as np
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
-import gymnasium as gym
 import math
+
+import gymnasium as gym
+import mlx.core as mx
+import mlx.optimizers as optim
+import numpy as np
+from mlx import nn
+from mlx.utils import tree_map
 
 # =====================================================================
 # MATHEMATICAL STABILIZERS & CUSTOM UTILITIES
@@ -15,6 +17,23 @@ def symlog(x):
 def symexp(x):
     return mx.sign(x) * (mx.exp(mx.abs(x)) - 1.0)
 
+class OUExplorationNoise:
+    """Generates temporally correlated random walks to build mechanical energy."""
+    def __init__(self, size, mu=0.0, theta=0.15, sigma=0.3):
+        self.mu = mu
+        self.theta = theta
+        self.sigma = sigma
+        self.size = size
+        self.state = np.ones(self.size) * self.mu
+
+    def reset(self):
+        self.state = np.ones(self.size) * self.mu
+
+    def sample(self):
+        dx = self.theta * (self.mu - self.state) + self.sigma * np.random.standard_normal(self.size)
+        self.state += dx
+        return self.state
+
 class TwoHotDist:
     def __init__(self, logits, min_val=-20.0, max_val=20.0, num_bins=255):
         self.logits = logits
@@ -25,22 +44,40 @@ class TwoHotDist:
         return mx.sum(probs * self.bins, axis=-1)
 
 class GRUCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
+    def __init__(self, input_dim: int, hidden_dim: int, bias: bool = True):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.xz_gates = nn.Linear(input_dim, 2 * hidden_dim)
-        self.hz_gates = nn.Linear(hidden_dim, 2 * hidden_dim)
-        self.xn_gate = nn.Linear(input_dim, hidden_dim)
-        self.hn_gate = nn.Linear(hidden_dim, hidden_dim)
+        self.input_size = input_dim
+        self.hidden_size = hidden_dim
 
-    def __call__(self, x, h):
-        xz = self.xz_gates(x)
-        hz = self.hz_gates(h)
-        r_logits, z_logits = mx.split(xz + hz, 2, axis=-1)
-        r = mx.sigmoid(r_logits)
-        z = mx.sigmoid(z_logits)
-        n = mx.tanh(self.xn_gate(x) + r * self.hn_gate(h))
-        return (1.0 - z) * n + z * h
+        # Equinox packs the 3 gate projections into a single weight matrix for performance.
+        # We do the same here using MLX Linear layers.
+        self.weight_ih = nn.Linear(input_dim, 3 * hidden_dim, bias=bias)
+        self.weight_hh = nn.Linear(hidden_dim, 3 * hidden_dim, bias=bias)
+
+    def __call__(self, x: mx.array, h: mx.array) -> mx.array:
+        """
+        Processes a single step.
+        x: shape (input_dim,) or (batch_size, input_dim)
+        h: shape (hidden_dim,) or (batch_size, hidden_dim)
+        """
+        # Project inputs and previous hidden state
+        gates_x = self.weight_ih(x)
+        gates_h = self.weight_hh(h)
+
+        # Split into reset (r), update (z), and candidate (n) gates
+        r_x, z_x, n_x = mx.split(gates_x, 3, axis=-1)
+        r_h, z_h, n_h = mx.split(gates_h, 3, axis=-1)
+
+        # Apply gate activations
+        r = mx.sigmoid(r_x + r_h)
+        z = mx.sigmoid(z_x + z_h)
+        
+        # Calculate new candidate hidden state
+        n = mx.tanh(n_x + r * n_h)
+
+        # Compute next hidden state
+        next_h = (1 - z) * n + z * h
+        return next_h
 
 # =====================================================================
 # RECURRENT STATE-SPACE MODEL WITH CONDITIONAL FLOW LATENTS
@@ -193,10 +230,15 @@ class ContinuousActor(nn.Module):
         return action, log_prob, entropy
 
 class ContinuousCritic(nn.Module):
-    def __init__(self, feature_dim, num_bins=255, hidden_dim=128):
+    def __init__(self, feature_dim: int, num_bins: int=255, hidden_dim: int=128):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(feature_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, num_bins))
-        self.bins = mx.linspace(-20.0, 20.0, num_bins)
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim), nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ELU(), 
+            nn.Linear(hidden_dim, num_bins)
+        )
+        # FIX: Expand tracking boundaries to match environment returns
+        self.bins = mx.linspace(-100.0, 100.0, num_bins) 
 
     def __call__(self, features):
         logits = self.net(features)
@@ -260,35 +302,28 @@ class ActorCriticUpdater:
         # 5. Evaluate policy actions matching target parameters
         _, log_prob, entropy = self.actor.sample_and_log_prob(imag_features[:, :-1])
         
-        # Quantify relative advantages and normalize to stabilize step variance
-        advantages = lambda_targets - imag_values_linear[:, :-1]
-        advantages = (advantages - mx.mean(advantages)) / (mx.std(advantages) + 1e-6)
+        # --- ALIGNMENT FIX: Compare targets against current values (index 1 to end) ---
+        # Lambda targets map out future values, so they must be compared with the 
+        # model's forward step evaluations to compute true advantages.
+        baseline_values = imag_values_linear[:, 1:] 
+        advantages = lambda_targets - baseline_values
         
-        # Actor Objective Loss Equation (Maximize Advantage + Entropy Regularization)
+        advantages = (advantages - mx.mean(advantages)) / (mx.std(advantages) + 1e-6)
         actor_loss = mx.mean(-log_prob * mx.stop_gradient(advantages) - self.entropy_coef * entropy)
 
         # 6. Critic Objective Loss Equation
         # Project targets back into Symlog space to optimize against Two-Hot outputs
         symlog_targets = mx.stop_gradient(symlog(lambda_targets))
         
-        # Map values back into cross-entropy indices matching the categorical output bins
+        # FIX: Update the index mapping arithmetic to match our new [-100, 100] bounds
         num_bins = critic_logits.shape[-1]
-        target_indices = mx.clip((symlog_targets + 20.0) / (40.0 / (num_bins - 1)), 0, num_bins - 1)
+        target_indices = mx.clip((symlog_targets + 100.0) / (200.0 / (num_bins - 1)), 0, num_bins - 1)
         target_indices = mx.astype(target_indices, mx.int32)
         
-        # --- FIX: Pure MLX alternative to one_hot() ---
-        # 1. Generate an index range array matching your number of categories
-        bin_indices = mx.arange(num_bins)  # Shape: (num_bins,)
-        
-        # 2. Add an explicit trailing dimension to target_indices to enable broadcasting
-        # target_indices: [B, Horizon-1] -> [B, Horizon-1, 1]
+        bin_indices = mx.arange(num_bins)
         expanded_targets = mx.expand_dims(target_indices, axis=-1)
-        
-        # 3. Perform a broadcasted comparison against the bin indices range
-        # Compares shape [B, Horizon-1, 1] == [num_bins] -> yields a [B, Horizon-1, num_bins] boolean array
         one_hot_targets = mx.astype(expanded_targets == bin_indices, mx.float32)
         
-        # Compute the categorical cross entropy loss
         critic_loss = mx.mean(nn.losses.cross_entropy(critic_logits[:, :-1], one_hot_targets))
 
         return actor_loss, critic_loss
@@ -359,31 +394,28 @@ class SequenceReplayBuffer:
 # MAIN EXECUTION PIPELINE
 # =====================================================================
 
+# =====================================================================
+# MAIN EXECUTION PIPELINE
+# =====================================================================
+
 def main():
-    BATCH_SIZE, SEQ_LEN = 8, 16
+    BATCH_SIZE, SEQ_LEN = 16, 64
+    PRE_FILL_EPISODES = 30
+    MAX_EPISODES = 500
     
     print("Initializing Farama Gymnasium Pendulum Environment...")
     env = gym.make("Pendulum-v1")
-    
-    # --- FIX: Extract the integer dimension from the shape tuple ---
     obs_dim = env.observation_space.shape[0]     # Unpacks (3,) -> 3
     action_dim = env.action_space.shape[0]       # Unpacks (1,) -> 1
     
-    replay_buffer = SequenceReplayBuffer(capacity=200, seq_len=SEQ_LEN)
-    wm = ContinuousDreamerWorldModel(obs_dim=obs_dim, action_dim=action_dim)
-    
+    replay_buffer = SequenceReplayBuffer(capacity=500, seq_len=SEQ_LEN)
+    wm = ContinuousDreamerWorldModel(obs_dim=obs_dim, action_dim=action_dim, deter_dim=256, latent_dim=32)
     feat_dim = wm.rssm.deter_dim + wm.rssm.latent_dim
     actor = ContinuousActor(feature_dim=feat_dim, action_dim=action_dim)
     critic = ContinuousCritic(feature_dim=feat_dim)
-    ac_updater = ActorCriticUpdater(actor, critic, wm)
+    ac_updater = ActorCriticUpdater(actor, critic, wm, gamma=0.99, lam=0.95, entropy_coef=1e-2)
 
-    wm_opt = optim.Adam(learning_rate=3e-4)
-    actor_opt = optim.Adam(learning_rate=1e-4)
-    critic_opt = optim.Adam(learning_rate=1e-4)
-
-    # 1. State-dependent gradient function wrappers
-    wm_grad_fn = nn.value_and_grad(wm, lambda m, o, a, r, c: m.calculate_loss(o, a, r, c))
-
+    # Wrap actor and critic into a container for multi-module gradient tracking
     class ActorCriticContainer(nn.Module):
         def __init__(self, actor_mod, critic_mod):
             super().__init__()
@@ -391,6 +423,13 @@ def main():
             self.critic = critic_mod
             
     ac_container = ActorCriticContainer(actor, critic)
+
+    wm_opt = optim.Adam(learning_rate=3e-4)
+    actor_opt = optim.Adam(learning_rate=3e-5)
+    critic_opt = optim.Adam(learning_rate=1e-3)
+
+    # State-dependent gradient function wrappers
+    wm_grad_fn = nn.value_and_grad(wm, lambda m, o, a, r, c: m.calculate_loss(o, a, r, c))
     
     def ac_loss_fn(m, sf):
         ac_updater.actor = m.actor
@@ -399,96 +438,142 @@ def main():
         
     ac_grad_fn = nn.value_and_grad(ac_container, ac_loss_fn)
 
-    # 2. Pre-fill Buffer using a baseline uniform action trace
-    print("Pre-filling Replay Buffer...")
-    for _ in range(5):
+    # 1. PRE-FILL PHASE: Gather random trajectories to warm up the buffer
+    print(f"Pre-filling Replay Buffer with {PRE_FILL_EPISODES} episodes...")
+    ou_noise = OUExplorationNoise(size=env.action_space.shape)
+
+    # --- INSIDE YOUR main() FUNCTION (SWAP THE PRE-FILL LOOP) ---
+    print(f"Pre-filling Replay Buffer with {PRE_FILL_EPISODES} high-energy explosive episodes...")
+    
+    for _ in range(PRE_FILL_EPISODES):
         obs, _ = env.reset() 
         obs_seq = [np.array(obs, dtype=np.float32).flatten()]
         act_seq, rew_seq, cont_seq = [], [], []
         
+        deter = mx.zeros((1, wm.rssm.deter_dim))
+        latent = mx.zeros((1, wm.rssm.latent_dim))
+        action_mx = mx.zeros((1, action_dim))
+        
+        # Bang-Bang holding variables
+        current_torque = np.random.choice([-1.0, 1.0])
+        hold_duration = np.random.randint(10, 25)
+        step_countdown = hold_duration
+        
         for _ in range(200):
-            action = env.action_space.sample() 
+            obs_mx = mx.reshape(mx.array(obs), (1, -1))
+            embed = wm.encoder(obs_mx)
+            deter, latent = wm.rssm.observe_step(latent, action_mx, deter, embed)
+            
+            # Manage holding timer
+            step_countdown -= 1
+            if step_countdown <= 0:
+                current_torque = -current_torque # Reverse direction completely
+                hold_duration = np.random.randint(10, 25)
+                step_countdown = hold_duration
+                
+            # Scale up to max environmental limits [-2.0, 2.0]
+            action = np.array([current_torque], dtype=np.float32) * 2.0
             next_obs, reward, terminated, truncated, _ = env.step(action)
+            
+            reward_scalar = float(reward)
             
             obs_seq.append(np.array(next_obs, dtype=np.float32).flatten())
             act_seq.append(np.array(action, dtype=np.float32).flatten())
-            rew_seq.append(np.array([reward], dtype=np.float32))
+            rew_seq.append(np.array([reward_scalar * 0.05], dtype=np.float32))
             cont_seq.append(np.array([0.0 if (terminated or truncated) else 1.0], dtype=np.float32))
+            
+            obs = next_obs
+            action_mx = mx.array(action)[None, ...]
             
         replay_buffer.add_episode(obs_seq[:200], act_seq[:200], rew_seq[:200], cont_seq[:200])
 
-    # 3. Interactive Reinforcement Training Loop
+    # 2. INTERACTIVE ONLINE REINFORCEMENT TRAINING LOOP
     print("Beginning Continuous Flow Dreamer Execution Loop...")
-    for episode in range(50):
+    for episode in range(MAX_EPISODES):
         obs, _ = env.reset() 
         deter = mx.zeros((1, wm.rssm.deter_dim))
         latent = mx.zeros((1, wm.rssm.latent_dim))
+        action_mx = mx.zeros((1, action_dim))
         
         episode_reward = 0.0
         obs_seq = [np.array(obs, dtype=np.float32).flatten()]
         act_seq, rew_seq, cont_seq = [], [], []
 
-        # --- ENVIRONMENT STEPPING INTERACTION PHASE ---
         for step in range(200):
-            features = mx.concatenate([deter, latent], axis=-1)
-            action_mx, _, _ = actor.sample_and_log_prob(features)
-            
-            # --- FIX: Flatten the numpy action vector completely to shape (1,) ---
-            action_np = np.array(action_mx).flatten() * 2.0 
-            
-            next_obs, reward, terminated, truncated, _ = env.step(action_np)
-            
-            # --- FIX: Force reward to be a pure scalar float to avoid matrix morphing ---
-            reward_scalar = float(reward)
-            episode_reward += reward_scalar
-
-            # Continuous model embedding step (Forces clean shape (1, 3))
-            obs_mx = mx.reshape(mx.array(next_obs), (1, -1)) 
+            obs_mx = mx.reshape(mx.array(obs), (1, -1)) 
             embed = wm.encoder(obs_mx)
             deter, latent = wm.rssm.observe_step(latent, action_mx, deter, embed)
 
+            features = mx.concatenate([deter, latent], axis=-1)
+            action_mx, _, _ = actor.sample_and_log_prob(features)
+            
+            noise = np.random.normal(0, 0.4, size=env.action_space.shape) # Injected variance
+            action_np = np.clip(np.array(action_mx).flatten() + noise, -1.0, 1.0) * 2.0 
+            
+            next_obs, reward, terminated, truncated, _ = env.step(action_np)
+            reward_scalar = float(reward)
+            episode_reward += reward_scalar 
+
+            # --- SHAPING FIX: Add an explicit height bonus to reward_scalar ---
+            # next_obs[0] is cos(theta). It is +1.0 at the absolute top, -1.0 at the bottom.
+            # This smoothly guides the model to favor height positions.
+            height_bonus = float(next_obs[0]) * 5.0
+            shaped_reward = (reward_scalar + height_bonus) * 0.05
+
             obs_seq.append(np.array(next_obs, dtype=np.float32).flatten())
             act_seq.append(np.array(action_np / 2.0, dtype=np.float32).flatten())  
-            rew_seq.append(np.array([reward_scalar], dtype=np.float32)) # Clean (1,) vector
+            rew_seq.append(np.array([shaped_reward], dtype=np.float32)) # Fed to the World Model
             cont_seq.append(np.array([0.0 if (terminated or truncated) else 1.0], dtype=np.float32))
+            
+            obs = next_obs
+
 
         replay_buffer.add_episode(obs_seq[:200], act_seq[:200], rew_seq[:200], cont_seq[:200])
 
         # --- GRAPH OPTIMIZATION PHASE ---
         b_obs, b_actions, b_rewards, b_continues = replay_buffer.sample_batch(BATCH_SIZE)
         
-        # A. Optimize World Model
+        # A. Optimize World Model Graph
         wm_loss, wm_grads = wm_grad_fn(wm, b_obs, b_actions, b_rewards, b_continues)
         wm_opt.update(wm, wm_grads)
+        a_loss_val, c_loss_val = 0.0, 0.0
 
-        # B. Extract features along true trajectories to anchor Dream Imagination
-        embeds = wm.encoder(b_obs)
-        d_s = mx.zeros((BATCH_SIZE, wm.rssm.deter_dim))
-        l_s = mx.zeros((BATCH_SIZE, wm.rssm.latent_dim))
-        sf_list = []
-        for t in range(SEQ_LEN):
-            prev_a = b_actions[:, t-1] if t > 0 else mx.zeros_like(b_actions[:, 0])
-            d_s, l_s = wm.rssm.observe_step(l_s, prev_a, d_s, embeds[:, t])
-            sf_list.append(mx.concatenate([d_s, l_s], axis=-1))
-        
-        start_features = mx.reshape(mx.stack(sf_list, axis=1), (-1, feat_dim))
-        
-        # C. Optimize Actor and Critic networks simultaneously
-        (a_loss, c_loss), ac_grads = ac_grad_fn(ac_container, start_features)
-        
-        # Pull parameters directly from the returned structural gradients dictionary
-        actor_opt.update(actor, ac_grads["actor"])
-        critic_opt.update(critic, ac_grads["critic"])
+        if episode >= 50:
+            embeds = wm.encoder(b_obs)
+            d_s = mx.zeros((BATCH_SIZE, wm.rssm.deter_dim))
+            l_s = mx.zeros((BATCH_SIZE, wm.rssm.latent_dim))
+            sf_list = []
+            for t in range(SEQ_LEN):
+                prev_a = b_actions[:, t-1] if t > 0 else mx.zeros_like(b_actions[:, 0])
+                d_s, l_s = wm.rssm.observe_step(l_s, prev_a, d_s, embeds[:, t])
+                sf_list.append(mx.concatenate([d_s, l_s], axis=-1))
+            
+            start_features = mx.reshape(mx.stack(sf_list, axis=1), (-1, feat_dim))
+            
+            # C. Optimize Actor and Critic networks simultaneously
+            (a_loss, c_loss), ac_grads = ac_grad_fn(ac_container, start_features)
+            
+            actor_grads = tree_map(lambda x: mx.clip(x, -10.0, 10.0), ac_grads["actor"])
+            critic_grads = tree_map(lambda x: mx.clip(x, -10.0, 10.0), ac_grads["critic"])
+            
+            actor_opt.update(actor, actor_grads)
+            critic_opt.update(critic, critic_grads)
+            
+            a_loss_val, c_loss_val = a_loss.item(), c_loss.item()
 
-        # D. Flush unified memory graphs to prevent RAM accumulation leaks
+        # D. Flush unified memory graphs to clear evaluated traces
         mx.eval(wm.parameters(), actor.parameters(), critic.parameters(), 
                 wm_opt.state, actor_opt.state, critic_opt.state)
                 
-        # --- FIX: Removed .item() from episode_reward since it is already a Python float ---
-        print(f"Episode {episode:02d} | Return: {episode_reward:7.2f} | "
-              f"WM Loss: {wm_loss.item():.3f} | Actor Loss: {a_loss.item():.3f} | Critic Loss: {c_loss.item():.3f}")
-
+        print(f"Episode {episode:03d} | Return: {episode_reward:7.2f} | "
+              f"WM Loss: {wm_loss.item():.3f} | Actor Loss: {a_loss_val:.3f} | Critic Loss: {c_loss_val:.3f}")
+    
+    # --- SAVE WEIGHTS TO DISK ---
+    print("\n💾 Saving trained model checkpoints...")
+    wm.save_weights("world_model.safetensors")
+    actor.save_weights("actor.safetensors")
+    critic.save_weights("critic.safetensors")
+    print("🎉 All weights saved successfully to disk as Safetensors!")
 
 if __name__ == "__main__":
     main()
-

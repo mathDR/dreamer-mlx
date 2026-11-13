@@ -1,19 +1,19 @@
-import pytest
-import numpy as np
 import mlx.core as mx
-import mlx.nn as nn
+import numpy as np
+import pytest
+from mlx import nn
 
 from main import (
-    symlog, 
-    symexp, 
-    TwoHotDist, 
-    GRUCell, 
-    ConditionalNormalizingFlow, 
-    ContinuousDreamerWorldModel, 
-    ContinuousActor, 
-    ContinuousCritic, 
-    ActorCriticUpdater, 
-    SequenceReplayBuffer
+    ActorCriticUpdater,
+    ConditionalNormalizingFlow,
+    ContinuousActor,
+    ContinuousCritic,
+    ContinuousDreamerWorldModel,
+    GRUCell,
+    SequenceReplayBuffer,
+    TwoHotDist,
+    symexp,
+    symlog,
 )
 
 # =====================================================================

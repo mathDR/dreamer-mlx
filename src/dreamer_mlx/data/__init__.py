@@ -1,3 +1,3 @@
-from .buffers import SequenceReplayBuffer
+from .replay_buffer import SequenceReplayBuffer
 
 __all__ = ["SequenceReplayBuffer"]

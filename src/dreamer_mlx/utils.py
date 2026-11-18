@@ -1,3 +1,5 @@
+import math
+
 import mlx.core as mx
 
 
@@ -15,3 +17,13 @@ class TwoHotDist:
     def mean(self):
         probs = mx.softmax(self.logits, axis=-1)
         return mx.sum(probs * self.bins, axis=-1)
+
+
+def gaussian_sample(mean, std):
+    """Reparameterized sample from a diagonal Gaussian N(mean, std^2)."""
+    return mean + std * mx.random.normal(mean.shape)
+
+
+def gaussian_entropy(std):
+    """Analytic entropy of a diagonal Gaussian, summed over the last axis."""
+    return mx.sum(mx.log(std) + 0.5 * (1.0 + math.log(2.0 * math.pi)), axis=-1)

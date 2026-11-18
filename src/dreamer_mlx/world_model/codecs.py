@@ -1,321 +1,202 @@
 import mlx.core as mx
+import mlx.optimizers as optim
 from mlx import nn
 
-from dreamer_mlx.utils import symexp, symlog
 
-
-class ImageEncoder(nn.Module):
-    """
-    DreamerV3 Convolutional Encoder.
-    Downsamples 64x64 images via 4 strided convolutions with LayerNorm + SiLU.
-    """
-
-    def __init__(self, in_channels: int = 3, depth: int = 48, kernel_size: int = 4):
+class ConvBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 2,
+        padding: int = 1,
+    ):
         super().__init__()
-        # Channel progression: depth * [1, 2, 4, 8] -> e.g., [48, 96, 192, 384]
-        multipliers = [1, 2, 4, 8]
-        channels = [depth * m for m in multipliers]
-        in_dims = [in_channels] + channels[:-1]
-
-        self.convs = []
-        self.norms = []
-
-        for c_in, c_out in zip(in_dims, channels):
-            # Stride 2 with padding 1 halves spatial dims at each stage:
-            # 64x64 -> 32x32 -> 16x16 -> 8x8 -> 4x4
-            self.convs.append(
-                nn.Conv2d(
-                    in_channels=c_in,
-                    out_channels=c_out,
-                    kernel_size=kernel_size,
-                    stride=2,
-                    padding=1,
-                    bias=False,  # Bias is redundant before LayerNorm
-                )
-            )
-            # MLX LayerNorm normalizes over the last axis (Channels in NHWC)
-            self.norms.append(nn.LayerNorm(c_out))
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        # groups == channels, matching the original (per-channel / instance-style norm)
+        self.norm = nn.GroupNorm(out_channels, out_channels, pytorch_compatible=True)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Normalize uint8 [0, 255] images to [-0.5, 0.5]
-        if x.dtype == mx.uint8:
-            x = x.astype(mx.float32) / 255.0 - 0.5
+        # x: (B, H, W, C)
+        x = self.conv(x)
+        x = self.norm(x)
+        return nn.silu(x)
 
-        for conv, norm in zip(self.convs, self.norms):
-            x = nn.silu(norm(conv(x)))
 
-        # Flatten spatial and channel dimensions: (B, H, W, C) -> (B, H * W * C)
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        hid_channels: int = 64,
+        num_spatial_layers: int = 4,
+    ):
+        super().__init__()
+        self.blocks = [
+            ConvBlock(in_channels if i == 0 else hid_channels, hid_channels)
+            for i in range(num_spatial_layers)
+        ]
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # Input: (B, H, W, C)  ->  Output: (B, FlattenedDim)
+        for block in self.blocks:
+            x = block(x)
         return x.reshape(x.shape[0], -1)
 
 
-class VectorEncoder(nn.Module):
-    """
-    DreamerV3 MLP Encoder for low-dimensional state/proprioceptive vectors.
-    Applies symlog to inputs followed by Linear + LayerNorm + SiLU blocks.
-    """
-
-    def __init__(self, in_dim: int, hidden_dim: int = 512, num_layers: int = 3):
+class Decoder(nn.Module):
+    def __init__(
+        self,
+        out_channels: int = 3,
+        hid_channels: int = 64,
+        num_spatial_layers: int = 4,
+        latent_size: int = 4,  # spatial size of the encoder's final feature map
+    ):
         super().__init__()
-        self.linears = []
-        self.norms = []
+        self.hid_channels = hid_channels
+        self.latent_size = latent_size
 
-        curr_dim = in_dim
-        for _ in range(num_layers):
-            self.linears.append(nn.Linear(curr_dim, hidden_dim, bias=False))
-            self.norms.append(nn.LayerNorm(hidden_dim))
-            curr_dim = hidden_dim
+        # Each layer exactly doubles H and W: (H-1)*2 - 2*1 + 3 + 1 = 2H
+        self.blocks = [
+            nn.ConvTranspose2d(
+                hid_channels, hid_channels, kernel_size=3, stride=2, padding=1, output_padding=1
+            )
+            for _ in range(num_spatial_layers)
+        ]
+        self.readout = nn.Conv2d(hid_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = symlog(x.astype(mx.float32))
-        for linear, norm in zip(self.linears, self.norms):
-            x = nn.silu(norm(linear(x)))
-        return x
+        # Input: (B, FlattenedDim)  ->  Output: (B, H, W, OutC)
+        # NHWC flatten order, consistent with Encoder above
+        x = x.reshape(x.shape[0], self.latent_size, self.latent_size, self.hid_channels)
+        for block in self.blocks:
+            x = nn.silu(block(x))
+        return self.readout(x)
 
 
-class DreamerV3Encoder(nn.Module):
-    """
-    Unified Multi-Modal Encoder combining visual and vector streams.
-    Supports arbitrary leading batch/time dimensions (e.g., (B, T, ...)).
-    """
-
-    def __init__(
-        self,
-        image_shape: tuple[int, int, int] | None = (64, 64, 3),
-        vector_dim: int | None = None,
-        cnn_depth: int = 48,
-        mlp_units: int = 512,
-        mlp_layers: int = 3,
-    ):
+class VariationalEncoder(nn.Module):
+    def __init__(self, in_channels=3, hid_channels=64, num_spatial_layers=4,
+                 latent_size=4, latent_dim=128):
         super().__init__()
-        if image_shape is None and vector_dim is None:
-            raise ValueError("Must specify at least one of image_shape or vector_dim.")
+        self.trunk = Encoder(in_channels, hid_channels, num_spatial_layers)
+        flat_dim = hid_channels * latent_size * latent_size
+        self.mean_head = nn.Linear(flat_dim, latent_dim)
+        self.std_head = nn.Linear(flat_dim, latent_dim)
+
+    def __call__(self, x):
+        h = self.trunk(x)                          # (B, flat_dim)
+        mean = self.mean_head(h)                   # (B, latent_dim)
+        std = nn.softplus(self.std_head(h)) + 1e-4 # strictly positive
+        return mean, std
 
 
-        if image_shape is not None:
-            self.has_image = True
-            self.img_encoder = ImageEncoder(
-                in_channels=image_shape[-1],
-                depth=cnn_depth,
-            )
-
-        if vector_dim is not None:
-            self.has_vector = True
-            self.vec_encoder = VectorEncoder(
-                in_dim=vector_dim,
-                hidden_dim=mlp_units,
-                num_layers=mlp_layers,
-            )
-
-    def __call__(
-        self,
-        image: mx.array | None = None,
-        vector: mx.array | None = None,
-    ) -> mx.array:
-        features = []
-
-        if self.has_image:
-            if image is None:
-                raise ValueError("Expected 'image' input, got None.")
-            lead_shape = image.shape[:-3]
-            flat_img = image.reshape(-1, *image.shape[-3:])
-            img_emb = self.img_encoder(flat_img)
-            features.append(img_emb.reshape(*lead_shape, -1))
-
-        if self.has_vector:
-            if vector is None:
-                raise ValueError("Expected 'vector' input, got None.")
-            lead_shape = vector.shape[:-1]
-            flat_vec = vector.reshape(-1, vector.shape[-1])
-            vec_emb = self.vec_encoder(flat_vec)
-            features.append(vec_emb.reshape(*lead_shape, -1))
-
-        return mx.concatenate(features, axis=-1) if len(features) > 1 else features[0]
-
-
-class ImageDecoder(nn.Module):
-    """
-    DreamerV3 Transposed Convolutional Decoder.
-    Projects latent state to 4x4 feature map, then upsamples to 64x64 via
-    4 transposed convolutions with LayerNorm + SiLU.
-    """
-
-    def __init__(
-        self,
-        latent_dim: int,
-        out_channels: int = 3,
-        depth: int = 48,
-        kernel_size: int = 4,
-    ):
+class VAEDecoder(nn.Module):
+    def __init__(self, out_channels=3, hid_channels=64, num_spatial_layers=4,
+                 latent_size=4, latent_dim=128):
         super().__init__()
-        # Mirror of encoder multipliers [1, 2, 4, 8] -> reversed: [8, 4, 2, 1]
-        multipliers = [8, 4, 2, 1]
-        channels = [depth * m for m in multipliers]
+        self.proj = nn.Linear(latent_dim, hid_channels * latent_size * latent_size)
+        self.decoder = Decoder(out_channels, hid_channels, num_spatial_layers, latent_size)
 
-        # Project latent vector to initial 4x4 spatial grid: (B, 4 * 4 * 8 * depth)
-        self.spatial_shape = (4, 4, channels[0])
-        self.in_proj = nn.Linear(latent_dim, 4 * 4 * channels[0], bias=False)
-        self.in_norm = nn.LayerNorm(channels[0])
-
-        # Channel progression: [8d -> 4d -> 2d -> 1d -> out_channels]
-        out_dims = channels[1:] + [out_channels]
-
-        self.deconvs = []
-        self.norms = []
-
-        for i, (c_in, c_out) in enumerate(zip(channels, out_dims)):
-            is_last = i == len(channels) - 1
-            # Stride 2, padding 1 doubles spatial dims at each stage:
-            # 4x4 -> 8x8 -> 16x16 -> 32x32 -> 64x64
-            self.deconvs.append(
-                nn.ConvTranspose2d(
-                    in_channels=c_in,
-                    out_channels=c_out,
-                    kernel_size=kernel_size,
-                    stride=2,
-                    padding=1,
-                    bias=is_last,  # Only the final output layer uses bias
-                )
-            )
-            if not is_last:
-                self.norms.append(nn.LayerNorm(c_out))
-
-    def __call__(self, latent: mx.array) -> mx.array:
-        # Project and reshape to (B, 4, 4, 8 * depth)
-        x = self.in_proj(latent)
-        x = x.reshape(latent.shape[0], *self.spatial_shape)
-        x = nn.silu(self.in_norm(x))
-
-        # Upsample through transposed conv blocks
-        for i, deconv in enumerate(self.deconvs):
-            x = deconv(x)
-            if i < len(self.norms):
-                x = nn.silu(self.norms[i](x))
-
-        # Shift output mean to match [-0.5, 0.5] normalized image range
-        return x + 0.5
+    def __call__(self, z):
+        return self.decoder(self.proj(z))
 
 
-class VectorDecoder(nn.Module):
-    """
-    DreamerV3 MLP Decoder for low-dimensional state/proprioceptive vectors.
-    Predicts in symlog space and applies symexp to restore original scale.
-    """
+def sample(mean, std):
+    # Reparameterization trick: gradients flow through mean and std
+    return mean + std * mx.random.normal(mean.shape)
 
-    def __init__(
-        self,
-        latent_dim: int,
-        out_dim: int,
-        hidden_dim: int = 512,
-        num_layers: int = 3,
-    ):
+
+def kl_divergence(mean, std):
+    kl = 0.5 * (mx.square(mean) + mx.square(std) - 1.0 - 2.0 * mx.log(std))
+    return kl.sum(axis=-1).mean()
+
+
+class VAE(nn.Module):
+    def __init__(self, in_channels=3, out_channels=3, hid_channels=64,
+                 num_spatial_layers=4, latent_size=4, latent_dim=128):
         super().__init__()
-        self.linears = []
-        self.norms = []
+        self.encoder = VariationalEncoder(
+            in_channels, hid_channels, num_spatial_layers, latent_size, latent_dim
+        )
+        self.decoder = VAEDecoder(
+            out_channels, hid_channels, num_spatial_layers, latent_size, latent_dim
+        )
+ 
+    def __call__(self, x):
+        mean, std = self.encoder(x)
+        z = sample(mean, std)
+        return self.decoder(z), mean, std
 
-        curr_dim = latent_dim
-        for _ in range(num_layers):
-            self.linears.append(nn.Linear(curr_dim, hidden_dim, bias=False))
-            self.norms.append(nn.LayerNorm(hidden_dim))
-            curr_dim = hidden_dim
+def loss_fn(model, x, beta):
+    recon, mean, std = model(x)
+    recon_loss = mx.square(recon - x).sum(axis=(1, 2, 3)).mean()
+    kl = kl_divergence(mean, std)
+    return recon_loss + beta * kl, recon_loss, kl   # flat tuple
 
-        # Final linear head projects to target vector dimension
-        self.out_proj = nn.Linear(hidden_dim, out_dim, bias=True)
+def make_batch(batch_size, img_size, channels):
+    coords = mx.linspace(0, 1, img_size)
+    freq = mx.random.uniform(1, 4, (batch_size, 1, 1, channels))
+    phase = mx.random.uniform(0, 6.28, (batch_size, 1, 1, channels))
+    xx = coords.reshape(1, 1, img_size, 1)
+    yy = coords.reshape(1, img_size, 1, 1)
+    return mx.sin(6.28 * freq * (xx + yy) + phase)
 
-    def __call__(self, latent: mx.array) -> mx.array:
-        x = latent
-        for linear, norm in zip(self.linears, self.norms):
-            x = nn.silu(norm(linear(x)))
-        # Network predicts symlog(target); symexp maps back to target space
-        return symexp(self.out_proj(x))
+def main():
+    enc, dec = Encoder(), Decoder()
+    img = mx.random.normal((2, 64, 64, 3))  # (B, H, W, C)
+    z = enc(img)
+    out = dec(z)
+    mx.eval(z, out)
+    assert z.shape == (2, 1024) 
+    assert out.shape == (2, 64, 64, 3)
 
-
-class DreamerV3Decoder(nn.Module):
-    """
-    Unified Multi-Modal Decoder reconstructing visual and vector observations
-    from the RSSM latent state s_t = [h_t, z_t].
-    """
-
-    def __init__(
-        self,
-        latent_dim: int,
-        image_shape: tuple[int, int, int] | None = (64, 64, 3),
-        vector_dim: int | None = None,
-        cnn_depth: int = 48,
-        mlp_units: int = 512,
-        mlp_layers: int = 3,
-    ):
-        super().__init__()
-        if image_shape is None and vector_dim is None:
-            raise ValueError("Must specify at least one of image_shape or vector_dim.")
-        
-                
-        if image_shape is not None:
-            self.has_image = True
-            self.img_decoder = ImageDecoder(
-                latent_dim=latent_dim,
-                out_channels=image_shape[-1],
-                depth=cnn_depth,
+    mx.random.seed(0)
+ 
+    # Config
+    batch_size = 16
+    img_size = 64          # 64 -> 4 after 4 stride-2 layers
+    channels = 3
+    latent_dim = 128
+    num_steps = 2000
+    beta_target = 1e-2
+    warmup_steps = 50
+ 
+    model = VAE(in_channels=channels, out_channels=channels, latent_dim=latent_dim)
+    mx.eval(model.parameters())
+ 
+    #optimizer = optim.Adam(learning_rate=1e-3)
+    optimizer = optim.Adam(learning_rate=optim.cosine_decay(1e-3, num_steps))
+    #lr = optim.cosine_decay(1e-4, num_steps)
+    #optimizer = optim.Lion(learning_rate=lr)
+    loss_and_grad = nn.value_and_grad(model, loss_fn)
+ 
+    for step in range(1, num_steps + 1):
+        # Placeholder data: replace with your real (B, H, W, C) frames
+        #x = mx.random.normal((batch_size, img_size, img_size, channels))
+        x = make_batch(batch_size, img_size, channels) 
+ 
+        beta = beta_target * min(1.0, step / warmup_steps)  # KL warmup
+        (loss, recon_loss, kl), grads = loss_and_grad(model, x, beta)
+        optimizer.update(model, grads)
+        mx.eval(model.parameters(), optimizer.state, loss)
+ 
+        if step % 100 == 0 or step == 1:
+            print(
+                f"step {step:4d} | loss {loss.item():.4f} | "
+                f"recon {recon_loss.item():.4f} | kl {kl.item():.4f} | beta {beta:.4f}"
             )
-
-        if vector_dim is not None:
-            self.has_vector = True
-            self.vec_decoder = VectorDecoder(
-                latent_dim=latent_dim,
-                out_dim=vector_dim,
-                hidden_dim=mlp_units,
-                num_layers=mlp_layers,
-            )
-
-
-    def __call__(self, latent: mx.array) -> dict[str, mx.array]:
-        lead_shape = latent.shape[:-1]
-        flat_latent = latent.reshape(-1, latent.shape[-1])
-        reconstructions = {}
-
-        if self.has_image:
-            img_rec = self.img_decoder(flat_latent)
-            reconstructions["image"] = img_rec.reshape(*lead_shape, *img_rec.shape[-3:])
-
-        if self.has_vector:
-            vec_rec = self.vec_decoder(flat_latent)
-            reconstructions["vector"] = vec_rec.reshape(*lead_shape, vec_rec.shape[-1])
-
-        return reconstructions
-
+ 
+    # Encode a batch to get the (mean, std) the dynamics model will consume
+    x = mx.random.normal((batch_size, img_size, img_size, channels))
+    mean, std = model.encoder(x)
+    z = sample(mean, std)
+    recon = model.decoder(z)
+    mx.eval(mean, std, z, recon)
+    print("mean:", mean.shape, "std:", std.shape, "z:", z.shape, "recon:", recon.shape)
+ 
+    # Save weights
+    model.save_weights("vae.safetensors")
+ 
+ 
 if __name__ == "__main__":
-    batch_size, seq_len = 128, 10
-    encoder = DreamerV3Encoder(
-        image_shape=(64, 64, 3),
-        vector_dim=24,
-        cnn_depth=48,  # 'S' / 'M' model size scale
-        mlp_units=512,
-        mlp_layers=3,
-    )
-
-    # Simulated replay buffer batch: (Batch, Time, ...)
-    obs_img = mx.random.randint(0, 256, shape=(batch_size, seq_len, 64, 64, 3), dtype=mx.uint8)
-    obs_vec = mx.random.normal(shape=(batch_size, seq_len, 24))
-
-    embed = encoder(image=obs_img, vector=obs_vec)
-    mx.eval(embed)
-
-    # For 64x64 image (4x4x384 = 6144) + 512 vector = 6656
-    print("Output embedding shape:", embed.shape)  # (16, 64, 6656)
-
-    latent_dim = 1536
-
-    decoder = DreamerV3Decoder(
-        latent_dim=latent_dim,
-        image_shape=(64, 64, 3),
-        vector_dim=24,
-        cnn_depth=48,
-        mlp_units=512,
-        mlp_layers=3,
-    )
-
-    latent_states = mx.random.normal(shape=(batch_size, seq_len, latent_dim))
-    preds = decoder(latent_states)
-    mx.eval(preds)
-
-    print("Reconstructed image shape:", preds["image"].shape)    # (16, 64, 64, 64, 3)
-    print("Reconstructed vector shape:", preds["vector"].shape)  # (16, 64, 24)
+    main()

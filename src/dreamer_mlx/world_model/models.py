@@ -1,7 +1,7 @@
 import mlx.core as mx
 from mlx import nn
 
-from dreamer_mlx.utils import TwoHotDist, symlog
+from dreamer_mlx.utils import TwoHotDist, gaussian_entropy, gaussian_sample, symlog
 
 
 class GRUCell(nn.Module):
@@ -91,20 +91,57 @@ class ConditionalNormalizingFlow(nn.Module):
         return current_z
 
 class FlowRSSM(nn.Module):
-    def __init__(self, action_dim, deter_dim=256, latent_dim=32):
+    """RSSM whose prior is a conditional normalizing flow p(z_t | h_t).
+
+    The posterior is either
+      * a conditional flow q(z_t | h_t, embed) over a fixed 128-d embedding
+        (``flow_posterior=True``, the original behaviour; ``observe_step``), or
+      * a Gaussian q(z_t | h_t, obs) produced by a Gaussian encoder head
+        (``flow_posterior=False``; ``observe_step_gaussian`` and ``gaussian_kl``).
+    """
+
+    def __init__(self, action_dim, deter_dim=256, latent_dim=32, flow_posterior=True):
         super().__init__()
         self.deter_dim = deter_dim
         self.latent_dim = latent_dim
         self.cell = GRUCell(input_dim=latent_dim + action_dim, hidden_dim=deter_dim)
         self.prior_flow = ConditionalNormalizingFlow(latent_dim, deter_dim)
-        self.posterior_flow = ConditionalNormalizingFlow(latent_dim, deter_dim + 128)
+        self.posterior_flow = (
+            ConditionalNormalizingFlow(latent_dim, deter_dim + 128) if flow_posterior else None
+        )
 
     def observe_step(self, prev_latent, prev_action, deter, embed):
+        if self.posterior_flow is None:
+            raise RuntimeError("flow_posterior=False: use observe_step_gaussian instead.")
         x = mx.concatenate([prev_latent, prev_action], axis=-1)
         deter = self.cell(x, deter)
         post_context = mx.concatenate([deter, embed], axis=-1)
         latent = self.posterior_flow.sample(post_context)
         return deter, latent
+
+    def observe_step_gaussian(self, prev_latent, prev_action, deter, features, encoder, sample=True):
+        """Posterior step with a Gaussian encoder.
+
+        ``encoder`` is a ``DreamerV3Encoder`` built with ``context_dim=deter_dim`` and
+        ``latent_dim=self.latent_dim``; ``features`` are its backbone features for this
+        step. The posterior is conditioned on the *updated* deter, as in ``observe_step``.
+        Returns (deter, latent, mean, std). With ``sample=False`` the latent is the mean.
+        """
+        x = mx.concatenate([prev_latent, prev_action], axis=-1)
+        deter = self.cell(x, deter)
+        mean, std = encoder.posterior(features, context=deter)
+        latent = gaussian_sample(mean, std) if sample else mean
+        return deter, latent, mean, std
+
+    def gaussian_kl(self, mean, std, latent, deter):
+        """Single-sample estimate of KL( N(mean, std^2) || prior_flow(. | deter) ).
+
+        KL = E_q[log q(z)] - E_q[log p(z)] = -H[q] - E_q[log p(z | h)].
+        The entropy term is analytic; the flow term uses the reparameterized sample
+        ``latent`` drawn from the same (mean, std), so gradients reach the encoder
+        (through mean, std and the sample) and the flow prior. Shape: (*lead,).
+        """
+        return -gaussian_entropy(std) - self.prior_flow.log_prob(latent, deter)
 
     def imagine_step(self, prev_latent, prev_action, deter):
         x = mx.concatenate([prev_latent, prev_action], axis=-1)

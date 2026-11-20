@@ -50,6 +50,7 @@ from dreamer_mlx.utils import TwoHotDist, symexp, symlog
 from dreamer_mlx.world_model import FlowRSSM
 from dreamer_mlx.world_model.codecs import DreamerV3Encoder, ImageDecoder
 
+
 # --------------------------------------------------------------------------- #
 # World model over pixels
 # --------------------------------------------------------------------------- #
